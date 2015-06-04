@@ -9,8 +9,12 @@ import Storage
 private let ThumbnailIdentifier = "Thumbnail"
 private let RowIdentifier = "Row"
 private let SeparatorKind = "separator"
-private let SeparatorIdentifier = "separator"
+private let CloseButtonKind = "closeButton"
 private let SeparatorColor = AppConstants.SeparatorColor
+
+struct TopSitesPanelUX {
+    static let SuggestedTileImagePadding: CGFloat = 10
+}
 
 class Tile: Site {
     let backgroundColor: UIColor
@@ -69,18 +73,40 @@ class TopSitesPanel: UIViewController, UICollectionViewDelegate, HomePanel {
     private var collection: TopSitesCollectionView!
     private var dataSource: TopSitesDataSource!
     private let layout = TopSitesLayout()
+    private lazy var longPressGesture: UILongPressGestureRecognizer = {
+        return UILongPressGestureRecognizer(target: self, action: "SELdidLongPress")
+    }()
+    private var closeButtonDidAnimateMap = [Int: Bool]()
+
+    var editMode : Bool = false {
+        didSet {
+            if editMode != oldValue {
+                if editMode {
+                    homePanelDelegate?.homePanelWillEnterEditingMode?(self)
+                } else {
+                    // If we exited editing mode, invalidate the animation state for the close buttons
+                    closeButtonDidAnimateMap = [Int: Bool]()
+                }
+
+                layout.editing = editMode
+                layout.invalidateLayout()
+            }
+        }
+    }
 
     var profile: Profile! {
         didSet {
-            // This needs to run on the main thread so that our dataSource is ready.
-            profile.history.getSitesByFrecencyWithLimit(100).uponQueue(dispatch_get_main_queue()) { result in
-                if let data = result.successValue {
-                    self.dataSource.data = data
-                    self.dataSource.profile = self.profile
-                    self.collection.reloadData()
-                }
-                // TODO: error handling.
-            }
+            profile.history.getSitesByFrecencyWithLimit(100).uponQueue(dispatch_get_main_queue(), block: { result in
+                self.updateDataSourceWithSites(result)
+                self.collection.reloadData()
+            })
+        }
+    }
+
+    private func updateDataSourceWithSites(result: Result<Cursor<Site>>) {
+        if let data = result.successValue {
+            self.dataSource.data = data
+            self.dataSource.profile = self.profile
         }
     }
 
@@ -94,6 +120,7 @@ class TopSitesPanel: UIViewController, UICollectionViewDelegate, HomePanel {
         dataSource = TopSitesDataSource(profile: profile, data: Cursor(status: .Failure, msg: "Nothing loaded yet"))
 
         layout.registerClass(TopSitesSeparator.self, forDecorationViewOfKind: SeparatorKind)
+        layout.registerClass(TopSitesCloseButton.self, forDecorationViewOfKind: CloseButtonKind)
 
         collection = TopSitesCollectionView(frame: self.view.frame, collectionViewLayout: layout)
         collection.backgroundColor = AppConstants.PanelBackgroundColor
@@ -102,6 +129,7 @@ class TopSitesPanel: UIViewController, UICollectionViewDelegate, HomePanel {
         collection.registerClass(ThumbnailCell.self, forCellWithReuseIdentifier: ThumbnailIdentifier)
         collection.registerClass(TwoLineCollectionViewCell.self, forCellWithReuseIdentifier: RowIdentifier)
         collection.keyboardDismissMode = .OnDrag
+        collection.addGestureRecognizer(longPressGesture)
         view.addSubview(collection)
         collection.snp_makeConstraints { make in
             make.edges.equalTo(self.view)
@@ -110,11 +138,71 @@ class TopSitesPanel: UIViewController, UICollectionViewDelegate, HomePanel {
     }
 
     func collectionView(collectionView: UICollectionView, didSelectItemAtIndexPath indexPath: NSIndexPath) {
+        if editMode {
+            return
+        }
+
         if let site = dataSource[indexPath.item] {
             // We're gonna call Top Sites bookmarks for now.
             let visitType = VisitType.Bookmark
             homePanelDelegate?.homePanel(self, didSelectURL: NSURL(string: site.url)!, visitType: visitType)
         }
+    }
+
+    func collectionView(collectionView: UICollectionView, willDisplaySupplementaryView view: UICollectionReusableView, forElementKind elementKind: String, atIndexPath indexPath: NSIndexPath) {
+        if elementKind == CloseButtonKind {
+            let closeView = view as! TopSitesCloseButton
+
+            closeView.indexPath = indexPath
+            closeView.removeButton.addTarget(self, action: "SELdidRemoveSuggestedTile:", forControlEvents: UIControlEvents.TouchUpInside)
+
+            // We don't want the buttons to animate everytime they come into view - only the first time after entering edit mode
+            if closeButtonDidAnimateMap[indexPath.item] == nil {
+                view.transform = CGAffineTransformMakeScale(0.01, 0.01)
+                UIView.animateWithDuration(0.4, delay: 0, usingSpringWithDamping: 0.6, initialSpringVelocity: 0, options: UIViewAnimationOptions.AllowUserInteraction |  UIViewAnimationOptions.CurveEaseInOut, animations: { () -> Void in
+                    view.transform = CGAffineTransformIdentity
+                }, completion: { finished in
+                    self.closeButtonDidAnimateMap[indexPath.item] = true
+                })
+            }
+        }
+    }
+
+    func SELdidLongPress() {
+        editMode = true
+    }
+
+    func SELdidRemoveSuggestedTile(sender: UIView!) {
+        let closeView = sender.superview as! TopSitesCloseButton
+        if let indexPath = closeView.indexPath {
+            let site = dataSource[indexPath.item]
+            if let url = site?.url {
+                self.deleteHistoryTileForURL(url, atIndexPath: indexPath)
+            }
+        }
+    }
+
+    private func deleteHistoryTileForURL(url: String, atIndexPath indexPath: NSIndexPath) {
+        profile.history.removeHistoryForURL(url) >>== {
+            self.profile.history.getSitesByFrecencyWithLimit(100).uponQueue(dispatch_get_main_queue(), block: { result in
+                self.updateDataSourceWithSites(result)
+                self.deleteOrUpdateSites(result, indexPath: indexPath)
+            })
+        }
+    }
+
+    private func deleteOrUpdateSites(result: Result<Cursor<Site>>, indexPath: NSIndexPath) {
+        if let data = result.successValue {
+            if data.count < layout.thumbnailCount {
+                self.collection.reloadData()
+            } else {
+                self.collection.deleteItemsAtIndexPaths([indexPath])
+            }
+        }
+    }
+
+    func endEditing() {
+        editMode = false
     }
 }
 
@@ -127,6 +215,8 @@ private class TopSitesCollectionView: UICollectionView {
 }
 
 private class TopSitesLayout: UICollectionViewLayout {
+    var editing: Bool = false
+
     private var thumbnailRows = 3
     private var thumbnailCols = 2
     private var thumbnailCount: Int { return thumbnailRows * thumbnailCols }
@@ -203,23 +293,41 @@ private class TopSitesLayout: UICollectionViewLayout {
             let attr = layoutAttributesForItemAtIndexPath(indexPath)
             attrs.append(attr)
 
-            if i >= thumbnailCount - 1 {
-                let decoration = layoutAttributesForDecorationViewOfKind(SeparatorKind, atIndexPath: indexPath)
+            var kind: String
+            if editing && indexPath.item < thumbnailCount {
+                kind = CloseButtonKind
+            } else {
+                kind = SeparatorKind
+            }
+
+            if let decoration = layoutAttributesForDecorationViewOfKind(kind, atIndexPath: indexPath) {
                 attrs.append(decoration)
             }
         }
         return attrs
     }
 
-    // Set the frames for the row separators.
+    // Set the frames for the row separators and close buttons if we are in editing mode.
     override func layoutAttributesForDecorationViewOfKind(elementKind: String, atIndexPath indexPath: NSIndexPath) -> UICollectionViewLayoutAttributes! {
-        let rowIndex = indexPath.item - thumbnailCount + 1
-        let rowYOffset = CGFloat(rowIndex) * AppConstants.DefaultRowHeight
-        let y = topSectionHeight + rowYOffset
+        if editing && indexPath.item < thumbnailCount {
+            let itemFrame = self.layoutAttributesForItemAtIndexPath(indexPath).frame
+            var deleteFrame = CGRect()
+            deleteFrame.size = CGSize(width: 20, height: 20)
+            deleteFrame.center = CGPoint(x: itemFrame.origin.x + TopSitesPanelUX.SuggestedTileImagePadding, y: itemFrame.origin.y + TopSitesPanelUX.SuggestedTileImagePadding)
+            var attrs = UICollectionViewLayoutAttributes(forDecorationViewOfKind: elementKind, withIndexPath: indexPath)
+            attrs.frame = deleteFrame
+            return attrs
+        } else if (indexPath.item - thumbnailCount + 1) >= 0 {
+            let rowIndex = indexPath.item - thumbnailCount + 1
+            let rowYOffset = CGFloat(rowIndex) * AppConstants.DefaultRowHeight
+            let y = topSectionHeight + rowYOffset
 
-        let decoration = UICollectionViewLayoutAttributes(forDecorationViewOfKind: elementKind, withIndexPath: indexPath)
-        decoration.frame = CGRectMake(0, y, width, 0.5)
-        return decoration
+            let decoration = UICollectionViewLayoutAttributes(forDecorationViewOfKind: elementKind, withIndexPath: indexPath)
+            decoration.frame = CGRectMake(0, y, width, 0.5)
+            return decoration
+        } else {
+            return nil
+        }
     }
 
     override func layoutAttributesForItemAtIndexPath(indexPath: NSIndexPath) -> UICollectionViewLayoutAttributes! {
@@ -317,7 +425,7 @@ private class TopSitesDataSource: NSObject, UICollectionViewDataSource {
             self.setDefaultThumbnailBackground(cell)
         }
 
-        cell.imagePadding = 10
+        cell.imagePadding = TopSitesPanelUX.SuggestedTileImagePadding
         cell.imageView.contentMode = UIViewContentMode.ScaleAspectFit
         cell.isAccessibilityElement = true
         cell.accessibilityLabel = cell.textLabel.text
@@ -366,10 +474,6 @@ private class TopSitesDataSource: NSObject, UICollectionViewDataSource {
         let cell = collectionView.dequeueReusableCellWithReuseIdentifier(RowIdentifier, forIndexPath: indexPath) as! TwoLineCollectionViewCell
         return createListCell(cell, site: site)
     }
-    
-    @objc func collectionView(collectionView: UICollectionView, viewForSupplementaryElementOfKind kind: String, atIndexPath indexPath: NSIndexPath) -> UICollectionReusableView {
-        return collectionView.dequeueReusableSupplementaryViewOfKind(kind, withReuseIdentifier: SeparatorIdentifier, forIndexPath: indexPath) as! UICollectionReusableView
-    }
 }
 
 private class TopSitesSeparator: UICollectionReusableView {
@@ -380,5 +484,29 @@ private class TopSitesSeparator: UICollectionReusableView {
 
     required init(coder aDecoder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+}
+
+private class TopSitesCloseButton: UICollectionReusableView {
+    let removeButton = UIButton()
+    var indexPath: NSIndexPath?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        removeButton.setImage(UIImage(named: "TileCloseButton"), forState: UIControlState.Normal)
+        addSubview(removeButton)
+    }
+
+    private override func prepareForReuse() {
+        indexPath = nil
+    }
+
+    required init(coder aDecoder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private override func layoutSubviews() {
+        super.layoutSubviews()
+        removeButton.frame = CGRect(origin: CGPointZero, size: frame.size)
     }
 }
